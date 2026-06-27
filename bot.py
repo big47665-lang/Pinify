@@ -10,6 +10,7 @@ import random
 import asyncio
 import re
 import json
+import time
 import urllib.request
 import urllib.parse
 from urllib.error import URLError
@@ -74,69 +75,122 @@ def mark_sent(conn, chat_id: str, query: str, url: str) -> None:
         pass  # already there
 
 
-# ── Pinterest Scraper ─────────────────────────────────────────────────────────
-PINTEREST_SEARCH = "https://www.pinterest.com/resource/BaseSearchResource/get/"
+# ── Image Scraper (DuckDuckGo → Pinterest CDN) ────────────────────────────────
+# Pinterest blocks direct API scraping from cloud IPs.
+# Instead we use DuckDuckGo's image search filtered to pinterest.com,
+# then extract the direct i.pinimg.com CDN URLs — always publicly accessible.
 
-HEADERS = {
+DDG_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/javascript, */*, q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.pinterest.com/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "DNT": "1",
 }
 
+# i.pinimg.com is Pinterest's image CDN — direct image links, no auth needed
+PINIMG_RE = re.compile(r'https://i\.pinimg\.com/[^\s"\'\\>]+\.(?:jpg|jpeg|png|webp)', re.IGNORECASE)
 
-def _extract_images_from_data(data: dict) -> list[str]:
-    """Walk the Pinterest JSON and collect original image URLs."""
-    urls: list[str] = []
+
+def _ddg_vqd(query: str) -> str:
+    """Get the DuckDuckGo vqd token required for image search."""
+    url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query) + "&iax=images&ia=images"
+    req = urllib.request.Request(url, headers=DDG_HEADERS)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+    m = re.search(r'vqd=(["\'])([^"\']+)\1', html)
+    if not m:
+        m = re.search(r'vqd=([\d-]+)', html)
+        return m.group(1) if m else ""
+    return m.group(2)
+
+
+def search_pinterest(query: str, page_size: int = 80) -> list[str]:
+    """
+    Search DuckDuckGo images filtered to site:pinterest.com,
+    extract i.pinimg.com CDN URLs and return them.
+    """
+    pinquery = f"{query} site:pinterest.com"
+
     try:
-        results = (
-            data.get("resource_response", {})
-            .get("data", {})
-            .get("results", [])
-        )
-        for pin in results:
-            images = pin.get("images", {})
-            # prefer highest resolution
-            for size in ("orig", "736x", "564x", "474x", "236x"):
-                img = images.get(size, {})
-                url = img.get("url", "")
-                if url and url.startswith("http"):
-                    urls.append(url)
-                    break
+        vqd = _ddg_vqd(pinquery)
     except Exception as exc:
-        log.warning("Image extraction error: %s", exc)
-    return urls
+        log.error("DDG vqd fetch failed: %s", exc)
+        return _fallback_search(query)
 
+    if not vqd:
+        log.warning("No vqd token found, trying fallback")
+        return _fallback_search(query)
 
-def search_pinterest(query: str, page_size: int = 50) -> list[str]:
-    """Return a list of image URLs from Pinterest for *query*."""
-    options = {
-        "isPrefetch": False,
-        "query": query,
-        "scope": "pins",
-        "no_fetch_context_on_resource": False,
-        "page_size": page_size,
-    }
-    params = urllib.parse.urlencode(
-        {"source_url": f"/search/pins/?q={urllib.parse.quote(query)}",
-         "data": json.dumps({"options": options, "context": {}}),
-         "_": ""}
-    )
-    url = f"{PINTEREST_SEARCH}?{params}"
+    params = urllib.parse.urlencode({
+        "l": "us-en",
+        "o": "json",
+        "q": pinquery,
+        "vqd": vqd,
+        "f": ",,,,,",
+        "p": "1",
+        "v7exp": "a",
+    })
+    api_url = "https://duckduckgo.com/i.js?" + params
+    headers = {**DDG_HEADERS, "Referer": "https://duckduckgo.com/"}
 
-    req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-            return _extract_images_from_data(data)
-    except (URLError, json.JSONDecodeError) as exc:
-        log.error("Pinterest fetch error: %s", exc)
+        time.sleep(0.5)  # be polite
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+        urls: list[str] = []
+        for item in data.get("results", []):
+            # DDG gives us the Pinterest page URL and a thumbnail
+            # The thumbnail IS the i.pinimg.com CDN link — grab it
+            img = item.get("image", "")
+            thumb = item.get("thumbnail", "")
+            for candidate in (img, thumb):
+                if candidate and "pinimg.com" in candidate:
+                    # Upgrade to 736x (high res) if possible
+                    upgraded = re.sub(r'/\d+x/', '/736x/', candidate)
+                    urls.append(upgraded)
+                    break
+            else:
+                # fallback: scan the page URL for embedded image refs
+                page = item.get("url", "")
+                if "pinterest" in page and img.startswith("http"):
+                    urls.append(img)
+
+        log.info("DDG search for '%s' returned %d images", query, len(urls))
+        return list(dict.fromkeys(urls))  # dedupe, preserve order
+
+    except Exception as exc:
+        log.error("DDG image search failed: %s", exc)
+        return _fallback_search(query)
+
+
+def _fallback_search(query: str) -> list[str]:
+    """
+    Last-resort: scrape DuckDuckGo HTML search results page and
+    extract any i.pinimg.com URLs found in the raw HTML.
+    """
+    log.info("Running HTML fallback scraper for '%s'", query)
+    url = (
+        "https://html.duckduckgo.com/html/?q="
+        + urllib.parse.quote(f"{query} site:pinterest.com")
+    )
+    try:
+        req = urllib.request.Request(url, headers=DDG_HEADERS)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        urls = PINIMG_RE.findall(html)
+        # Upgrade resolution
+        upgraded = [re.sub(r'/\d+x/', '/736x/', u) for u in urls]
+        unique = list(dict.fromkeys(upgraded))
+        log.info("HTML fallback found %d images", len(unique))
+        return unique
+    except Exception as exc:
+        log.error("HTML fallback also failed: %s", exc)
         return []
 
 
