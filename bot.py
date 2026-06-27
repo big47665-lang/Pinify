@@ -1,6 +1,14 @@
 """
-Pinify Bot — Pinterest image search for Telegram
-Supports English and Persian | /pinme & /پینمی commands
+Pinify Bot v2 — Pinterest-accurate image search for Telegram
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Features:
+  • Claude AI expands every query semantically (like Pinterest's own engine)
+  • Per-user taste profile builds over time from search history
+  • Claude reads the profile and personalizes future expansions to YOUR style
+  • Multi-query scraping (4 sub-queries in parallel) = way more results
+  • 3-layer scraper: DDG JSON → DDG HTML → Bing fallback
+  • Zero duplicate images per user per topic
+  • English + Persian (فارسی)
 """
 
 import os
@@ -15,24 +23,29 @@ import urllib.request
 import urllib.parse
 from urllib.error import URLError
 
+import anthropic
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DB_PATH   = "pinify.db"
+# ── Config ─────────────────────────────────────────────────────────────────────
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+DB_PATH       = "pinify.db"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -40,360 +53,531 @@ logging.basicConfig(
 )
 log = logging.getLogger("pinify")
 
+ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
-# ── Database ──────────────────────────────────────────────────────────────────
+
+# ── Database ───────────────────────────────────────────────────────────────────
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS sent_images (
-            chat_id   TEXT NOT NULL,
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sent_images (
+            user_id   TEXT NOT NULL,
             query     TEXT NOT NULL,
             image_url TEXT NOT NULL,
-            PRIMARY KEY (chat_id, query, image_url)
-        )"""
-    )
+            PRIMARY KEY (user_id, query, image_url)
+        );
+        CREATE TABLE IF NOT EXISTS user_profile (
+            user_id        TEXT PRIMARY KEY,
+            search_history TEXT NOT NULL DEFAULT '[]',
+            taste_tags     TEXT NOT NULL DEFAULT '[]',
+            updated_at     INTEGER NOT NULL DEFAULT 0
+        );
+    """)
     conn.commit()
     return conn
 
 
-def already_sent(conn, chat_id: str, query: str, url: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM sent_images WHERE chat_id=? AND query=? AND image_url=?",
-        (chat_id, query, url),
+DB = db_connect()
+
+
+def already_sent(user_id: str, query: str, url: str) -> bool:
+    cur = DB.execute(
+        "SELECT 1 FROM sent_images WHERE user_id=? AND query=? AND image_url=?",
+        (user_id, query, url),
     )
     return cur.fetchone() is not None
 
 
-def mark_sent(conn, chat_id: str, query: str, url: str) -> None:
+def mark_sent(user_id: str, query: str, url: str) -> None:
     try:
-        conn.execute(
-            "INSERT INTO sent_images (chat_id, query, image_url) VALUES (?,?,?)",
-            (chat_id, query, url),
+        DB.execute(
+            "INSERT INTO sent_images (user_id, query, image_url) VALUES (?,?,?)",
+            (user_id, query, url),
         )
-        conn.commit()
+        DB.commit()
     except sqlite3.IntegrityError:
-        pass  # already there
+        pass
 
 
-# ── Image Scraper (DuckDuckGo → Pinterest CDN) ────────────────────────────────
-# Pinterest blocks direct API scraping from cloud IPs.
-# Instead we use DuckDuckGo's image search filtered to pinterest.com,
-# then extract the direct i.pinimg.com CDN URLs — always publicly accessible.
+# ── User Taste Profile ─────────────────────────────────────────────────────────
+def get_profile(user_id: str) -> dict:
+    row = DB.execute(
+        "SELECT search_history, taste_tags FROM user_profile WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return {"history": [], "taste_tags": []}
+    return {
+        "history": json.loads(row[0]),
+        "taste_tags": json.loads(row[1]),
+    }
 
-DDG_HEADERS = {
+
+def update_profile(user_id: str, query: str, new_tags: list[str]) -> None:
+    """Add this search to history and merge new taste tags."""
+    profile = get_profile(user_id)
+
+    history = profile["history"]
+    history.append(query)
+    history = history[-30:]  # keep last 30 searches
+
+    # merge taste tags, most recent first, cap at 40
+    existing = profile["taste_tags"]
+    merged = list(dict.fromkeys(new_tags + existing))[:40]
+
+    DB.execute(
+        """INSERT INTO user_profile (user_id, search_history, taste_tags, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               search_history=excluded.search_history,
+               taste_tags=excluded.taste_tags,
+               updated_at=excluded.updated_at""",
+        (user_id, json.dumps(history), json.dumps(merged), int(time.time())),
+    )
+    DB.commit()
+
+
+def reset_profile(user_id: str) -> None:
+    DB.execute("DELETE FROM user_profile WHERE user_id=?", (user_id,))
+    DB.execute("DELETE FROM sent_images WHERE user_id=?", (user_id,))
+    DB.commit()
+
+
+# ── Claude AI: Query Expansion + Taste Inference ───────────────────────────────
+def ai_expand_query(raw_query: str, profile: dict) -> dict:
+    """
+    Ask Claude to:
+    1. Expand the raw query into 4 Pinterest-optimised search sub-queries
+    2. Extract taste tags from this search
+    3. Factor in the user's taste profile to personalise
+    Returns {"sub_queries": [...], "tags": [...], "display_theme": "..."}
+    Falls back to a simple expansion if AI is unavailable.
+    """
+    if not ai:
+        return _simple_expand(raw_query)
+
+    history_str = ", ".join(profile["history"][-10:]) if profile["history"] else "none yet"
+    tags_str    = ", ".join(profile["taste_tags"][:20]) if profile["taste_tags"] else "none yet"
+
+    prompt = f"""You are the search engine behind a Pinterest-like bot called Pinify.
+A user searched for: "{raw_query}"
+
+Their recent search history: {history_str}
+Their established taste profile tags: {tags_str}
+
+Your job:
+1. Generate exactly 4 diverse Pinterest search sub-queries in ENGLISH that will find highly relevant, beautiful images for what this person wants. Make them specific and visual — like how someone would search Pinterest. Use aesthetic terminology, visual descriptors, moods. Each sub-query should approach the topic from a slightly different angle to maximise variety.
+2. Extract 3-6 short taste tags from THIS search (e.g. "minimalist", "warm tones", "cottagecore") to build their taste profile.
+3. Write a very short display theme label (2-5 words) summarising what vibe you're searching for.
+
+IMPORTANT: If the user has a taste profile, subtly personalise the sub-queries to match their aesthetic. For example, if their history shows they love dark/moody aesthetics, lean darker even if their query is neutral.
+
+Respond ONLY with valid JSON, no markdown, no explanation:
+{{
+  "sub_queries": ["query1", "query2", "query3", "query4"],
+  "tags": ["tag1", "tag2", "tag3"],
+  "display_theme": "short vibe label"
+}}"""
+
+    try:
+        resp = ai.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # strip markdown fences if any
+        text = re.sub(r"^```[a-z]*\n?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(text)
+        return {
+            "sub_queries": data.get("sub_queries", [raw_query]),
+            "tags":        data.get("tags", []),
+            "display_theme": data.get("display_theme", raw_query),
+        }
+    except Exception as exc:
+        log.warning("Claude expansion failed: %s — using fallback", exc)
+        return _simple_expand(raw_query)
+
+
+def _simple_expand(query: str) -> dict:
+    """No-AI fallback: just add aesthetic modifiers."""
+    base = query.strip()
+    return {
+        "sub_queries": [
+            f"{base} aesthetic",
+            f"{base} pinterest",
+            f"{base} inspo",
+            f"{base} mood board",
+        ],
+        "tags": [base],
+        "display_theme": base,
+    }
+
+
+# ── Image Scraper (Multi-layer DDG → Bing fallback) ────────────────────────────
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "DNT": "1",
 }
 
-# i.pinimg.com is Pinterest's image CDN — direct image links, no auth needed
-PINIMG_RE = re.compile(r'https://i\.pinimg\.com/[^\s"\'\\>]+\.(?:jpg|jpeg|png|webp)', re.IGNORECASE)
+PINIMG_RE = re.compile(
+    r'https://i\.pinimg\.com/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)',
+    re.IGNORECASE,
+)
+
+
+def _upgrade_res(url: str) -> str:
+    """Swap any size prefix for 736x (high res)."""
+    return re.sub(r'/\d+x(?:/|\.)', '/736x/', url)
 
 
 def _ddg_vqd(query: str) -> str:
-    """Get the DuckDuckGo vqd token required for image search."""
     url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query) + "&iax=images&ia=images"
-    req = urllib.request.Request(url, headers=DDG_HEADERS)
+    req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=10) as resp:
         html = resp.read().decode("utf-8", errors="ignore")
-    m = re.search(r'vqd=(["\'])([^"\']+)\1', html)
-    if not m:
-        m = re.search(r'vqd=([\d-]+)', html)
-        return m.group(1) if m else ""
-    return m.group(2)
+    m = re.search(r'vqd=(["\'])([^"\']+)\1', html) or re.search(r'vqd=([\d\-]+)', html)
+    if m:
+        return m.group(2) if m.lastindex == 2 else m.group(1)
+    return ""
 
 
-def search_pinterest(query: str, page_size: int = 80) -> list[str]:
-    """
-    Search DuckDuckGo images filtered to site:pinterest.com,
-    extract i.pinimg.com CDN URLs and return them.
-    """
-    pinquery = f"{query} site:pinterest.com"
-
+def _scrape_ddg_json(query: str) -> list[str]:
     try:
-        vqd = _ddg_vqd(pinquery)
-    except Exception as exc:
-        log.error("DDG vqd fetch failed: %s", exc)
-        return _fallback_search(query)
-
-    if not vqd:
-        log.warning("No vqd token found, trying fallback")
-        return _fallback_search(query)
-
-    params = urllib.parse.urlencode({
-        "l": "us-en",
-        "o": "json",
-        "q": pinquery,
-        "vqd": vqd,
-        "f": ",,,,,",
-        "p": "1",
-        "v7exp": "a",
-    })
-    api_url = "https://duckduckgo.com/i.js?" + params
-    headers = {**DDG_HEADERS, "Referer": "https://duckduckgo.com/"}
-
-    try:
-        time.sleep(0.5)  # be polite
-        req = urllib.request.Request(api_url, headers=headers)
+        vqd = _ddg_vqd(f"{query} site:pinterest.com")
+        if not vqd:
+            return []
+        params = urllib.parse.urlencode({
+            "l": "us-en", "o": "json",
+            "q": f"{query} site:pinterest.com",
+            "vqd": vqd, "f": ",,,,,", "p": "1",
+        })
+        req = urllib.request.Request(
+            "https://duckduckgo.com/i.js?" + params,
+            headers={**HEADERS, "Referer": "https://duckduckgo.com/"},
+        )
+        time.sleep(0.3)
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-
-        urls: list[str] = []
+        urls = []
         for item in data.get("results", []):
-            # DDG gives us the Pinterest page URL and a thumbnail
-            # The thumbnail IS the i.pinimg.com CDN link — grab it
-            img = item.get("image", "")
-            thumb = item.get("thumbnail", "")
-            for candidate in (img, thumb):
-                if candidate and "pinimg.com" in candidate:
-                    # Upgrade to 736x (high res) if possible
-                    upgraded = re.sub(r'/\d+x/', '/736x/', candidate)
-                    urls.append(upgraded)
+            for key in ("image", "thumbnail"):
+                val = item.get(key, "")
+                if val and "pinimg.com" in val:
+                    urls.append(_upgrade_res(val))
                     break
-            else:
-                # fallback: scan the page URL for embedded image refs
-                page = item.get("url", "")
-                if "pinterest" in page and img.startswith("http"):
-                    urls.append(img)
-
-        log.info("DDG search for '%s' returned %d images", query, len(urls))
-        return list(dict.fromkeys(urls))  # dedupe, preserve order
-
+        return urls
     except Exception as exc:
-        log.error("DDG image search failed: %s", exc)
-        return _fallback_search(query)
-
-
-def _fallback_search(query: str) -> list[str]:
-    """
-    Last-resort: scrape DuckDuckGo HTML search results page and
-    extract any i.pinimg.com URLs found in the raw HTML.
-    """
-    log.info("Running HTML fallback scraper for '%s'", query)
-    url = (
-        "https://html.duckduckgo.com/html/?q="
-        + urllib.parse.quote(f"{query} site:pinterest.com")
-    )
-    try:
-        req = urllib.request.Request(url, headers=DDG_HEADERS)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        urls = PINIMG_RE.findall(html)
-        # Upgrade resolution
-        upgraded = [re.sub(r'/\d+x/', '/736x/', u) for u in urls]
-        unique = list(dict.fromkeys(upgraded))
-        log.info("HTML fallback found %d images", len(unique))
-        return unique
-    except Exception as exc:
-        log.error("HTML fallback also failed: %s", exc)
+        log.debug("DDG JSON scrape failed for '%s': %s", query, exc)
         return []
 
 
-def pick_fresh_images(
-    conn, chat_id: str, query: str, all_urls: list[str], count: int = 4
-) -> list[str]:
-    """Return *count* URLs the chat hasn't seen yet for this query."""
+def _scrape_ddg_html(query: str) -> list[str]:
+    try:
+        url = ("https://html.duckduckgo.com/html/?q="
+               + urllib.parse.quote(f"{query} site:pinterest.com"))
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        return [_upgrade_res(u) for u in PINIMG_RE.findall(html)]
+    except Exception as exc:
+        log.debug("DDG HTML scrape failed for '%s': %s", query, exc)
+        return []
+
+
+def _scrape_bing(query: str) -> list[str]:
+    """Bing image search as final fallback."""
+    try:
+        params = urllib.parse.urlencode({
+            "q": f"{query} site:pinterest.com",
+            "form": "HDRSC2", "first": "1", "tsc": "ImageHoverTitle",
+        })
+        url = "https://www.bing.com/images/search?" + params
+        req = urllib.request.Request(url, headers={
+            **HEADERS,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        return [_upgrade_res(u) for u in PINIMG_RE.findall(html)]
+    except Exception as exc:
+        log.debug("Bing scrape failed for '%s': %s", query, exc)
+        return []
+
+
+def scrape_one_query(query: str) -> list[str]:
+    """Try all 3 layers for a single sub-query, return deduplicated URLs."""
+    urls = _scrape_ddg_json(query)
+    if len(urls) < 5:
+        urls += _scrape_ddg_html(query)
+    if len(urls) < 5:
+        urls += _scrape_bing(query)
+    return list(dict.fromkeys(urls))
+
+
+def scrape_all_subqueries(sub_queries: list[str]) -> list[str]:
+    """
+    Run up to 4 sub-queries concurrently using threads,
+    interleave results so variety is maximised.
+    """
+    import concurrent.futures
+    results: list[list[str]] = [[] for _ in sub_queries]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(scrape_one_query, q): i for i, q in enumerate(sub_queries)}
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                log.warning("Sub-query %d failed: %s", idx, exc)
+
+    # interleave: take 1 from each list in rotation for variety
+    interleaved: list[str] = []
+    max_len = max((len(r) for r in results), default=0)
+    for i in range(max_len):
+        for r in results:
+            if i < len(r):
+                interleaved.append(r[i])
+
+    return list(dict.fromkeys(interleaved))
+
+
+def pick_fresh(user_id: str, base_query: str, all_urls: list[str], count: int = 4) -> list[str]:
     random.shuffle(all_urls)
-    chosen: list[str] = []
+    chosen = []
     for url in all_urls:
         if len(chosen) >= count:
             break
-        if not already_sent(conn, chat_id, query, url):
+        if not already_sent(user_id, base_query, url):
             chosen.append(url)
     return chosen
 
 
-# ── Text helpers ──────────────────────────────────────────────────────────────
-def normalize_query(text: str) -> str:
-    """Lower-case and strip the query."""
-    return text.strip().lower()
-
-
+# ── Text helpers ───────────────────────────────────────────────────────────────
 def detect_pinme(text: str) -> str | None:
-    """
-    Return the search query if the message starts with pinme or پینمی,
-    else return None.
-    """
-    text = text.strip()
-    pattern = re.compile(
-        r"^(?:pinme|پینمی)\s+(.+)$",
-        re.IGNORECASE | re.DOTALL,
-    )
-    m = pattern.match(text)
+    m = re.match(r"^(?:pinme|پینمی)\s+(.+)$", text.strip(), re.IGNORECASE | re.DOTALL)
     return m.group(1).strip() if m else None
 
 
-# ── Telegram Handlers ─────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    bot_username = (await ctx.bot.get_me()).username
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ Add Pinify to a group",
-                url=f"https://t.me/{bot_username}?startgroup=true",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📌 How to use",
-                callback_data="help",
-            )
-        ],
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
+def is_fa(text: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", text))
 
+
+# ── Telegram Handlers ──────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    me = (await ctx.bot.get_me()).username
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Pinify to a group", url=f"https://t.me/{me}?startgroup=true")],
+        [InlineKeyboardButton("🎨 My Taste Profile", callback_data="profile")],
+        [InlineKeyboardButton("🔄 Reset My Profile", callback_data="reset_confirm")],
+    ]
     msg = (
         "📌 *Welcome to Pinify!*\n\n"
-        "I search Pinterest and bring you 4 fresh photos for any vibe.\n\n"
+        "I find Pinterest photos for any vibe — and I learn your taste over time "
+        "to get more accurate with every search.\n\n"
         "🇬🇧 *English:*\n"
-        "`pinme <your topic>`\n"
-        "_Example:_ `pinme dark academia aesthetic`\n\n"
+        "`pinme <anything>`\n"
+        "_Try:_ `pinme cozy bedroom` · `pinme dark aesthetic` · `pinme flowers`\n\n"
         "🇮🇷 *فارسی:*\n"
-        "`پینمی <موضوع شما>`\n"
-        "_مثال:_ `پینمی گل‌های زیبا`\n\n"
-        "✨ Every search gives different photos — no repeats!"
+        "`پینمی <هر چیزی>`\n"
+        "_مثال:_ `پینمی دکوراسیون` · `پینمی طبیعت` · `پینمی کافه`\n\n"
+        "✨ The more you search, the better I know your style."
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    bot_username = (await ctx.bot.get_me()).username
-    keyboard = [[
-        InlineKeyboardButton(
-            "➕ Add Pinify to a group",
-            url=f"https://t.me/{bot_username}?startgroup=true",
+async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    profile = get_profile(user_id)
+    me = (await ctx.bot.get_me()).username
+
+    if not profile["history"]:
+        msg = (
+            "🎨 *Your Taste Profile*\n\n"
+            "You haven't searched anything yet!\n"
+            "Start with `pinme <topic>` and I'll learn your style."
         )
-    ]]
-    markup = InlineKeyboardMarkup(keyboard)
+    else:
+        recent = " · ".join(f"`{h}`" for h in profile["history"][-8:])
+        tags   = " · ".join(f"#{t}" for t in profile["taste_tags"][:15]) or "_none yet_"
+        msg = (
+            f"🎨 *Your Taste Profile*\n\n"
+            f"*Recent searches:*\n{recent}\n\n"
+            f"*Your aesthetic tags:*\n{tags}\n\n"
+            f"_The more you search, the more personalised your results become._"
+        )
 
-    msg = (
-        "📌 *Pinify — Help*\n\n"
-        "*Commands:*\n"
-        "• `pinme <topic>` — search in English\n"
-        "• `پینمی <موضوع>` — جستجو به فارسی\n\n"
-        "*Examples / مثال‌ها:*\n"
-        "`pinme cozy winter bedroom`\n"
-        "`pinme minimalist workspace`\n"
-        "`پینمی طبیعت پاییزی`\n"
-        "`پینمی دکوراسیون مدرن`\n\n"
-        "*Notes:*\n"
-        "• I send 4 images per request 🖼\n"
-        "• Same query → always fresh photos, never duplicates ✅\n"
-        "• Works in groups too! Add me with the button below 👇"
+    keyboard = [[
+        InlineKeyboardButton("➕ Add Pinify to a group", url=f"https://t.me/{me}?startgroup=true"),
+        InlineKeyboardButton("🔄 Reset Profile", callback_data="reset_confirm"),
+    ]]
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+
+
+async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user_id = str(q.from_user.id)
+
+    if q.data == "profile":
+        profile = get_profile(user_id)
+        if not profile["history"]:
+            text = "🎨 *Your Taste Profile*\n\nNo searches yet! Try `pinme <topic>` first."
+        else:
+            recent = " · ".join(f"`{h}`" for h in profile["history"][-8:])
+            tags   = " · ".join(f"#{t}" for t in profile["taste_tags"][:15]) or "_none yet_"
+            text = (
+                f"🎨 *Your Taste Profile*\n\n"
+                f"*Recent searches:*\n{recent}\n\n"
+                f"*Your aesthetic tags:*\n{tags}"
+            )
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Reset Profile", callback_data="reset_confirm"),
+                InlineKeyboardButton("« Back", callback_data="back_start"),
+            ]]))
+
+    elif q.data == "reset_confirm":
+        await q.edit_message_text(
+            "⚠️ *Reset your profile?*\n\nThis clears your search history, taste tags, and sent-image memory. Cannot be undone.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes, reset", callback_data="reset_do"),
+                InlineKeyboardButton("❌ Cancel", callback_data="back_start"),
+            ]]),
+        )
+
+    elif q.data == "reset_do":
+        reset_profile(user_id)
+        await q.edit_message_text(
+            "✅ *Profile reset!*\n\nFresh start — I'll learn your taste again from scratch.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif q.data == "back_start":
+        me = (await ctx.bot.get_me()).username
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Pinify to a group", url=f"https://t.me/{me}?startgroup=true")],
+            [InlineKeyboardButton("🎨 My Taste Profile", callback_data="profile")],
+            [InlineKeyboardButton("🔄 Reset My Profile", callback_data="reset_confirm")],
+        ]
+        await q.edit_message_text(
+            "📌 *Pinify* — Type `pinme <anything>` to search Pinterest.\n\n"
+            "I personalise results based on your taste — the more you search, the better I get!",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def handle_pinme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Central handler: fires when a message contains pinme / پینمی."""
     message = update.message or update.channel_post
     if not message or not message.text:
         return
 
     raw_query = detect_pinme(message.text)
     if raw_query is None:
-        return  # not a pinme trigger
+        return
 
-    query      = normalize_query(raw_query)
-    chat_id    = str(message.chat_id)
-    lang_fa    = bool(re.search(r"[\u0600-\u06FF]", message.text))  # has Persian chars?
+    user_id  = str(message.from_user.id if message.from_user else message.chat_id)
+    base_key = raw_query.strip().lower()
+    fa       = is_fa(message.text)
 
-    # Acknowledge
-    if lang_fa:
-        ack = await message.reply_text(f"🔍 در حال جستجو برای «{raw_query}» در پینترست...")
-    else:
-        ack = await message.reply_text(f"🔍 Searching Pinterest for *{raw_query}*…", parse_mode=ParseMode.MARKDOWN)
+    # ── Step 1: Acknowledge ───────────────────────────────────────────────────
+    ack_text = (
+        f"🔍 در حال یافتن تصاویر برای «{raw_query}»..." if fa
+        else f"🔍 Finding images for *{raw_query}*…"
+    )
+    ack = await message.reply_text(ack_text, parse_mode=ParseMode.MARKDOWN)
 
-    # Search
-    conn     = db_connect()
-    all_urls = await asyncio.to_thread(search_pinterest, query, 80)
+    # ── Step 2: Get profile + AI expansion (in thread) ────────────────────────
+    profile = get_profile(user_id)
+    expansion = await asyncio.to_thread(ai_expand_query, raw_query, profile)
+    sub_queries    = expansion["sub_queries"]
+    new_tags       = expansion["tags"]
+    display_theme  = expansion["display_theme"]
+
+    log.info("User %s | query='%s' | sub_queries=%s | tags=%s",
+             user_id, raw_query, sub_queries, new_tags)
+
+    # ── Step 3: Scrape all sub-queries in parallel ────────────────────────────
+    all_urls = await asyncio.to_thread(scrape_all_subqueries, sub_queries)
+    log.info("Total URLs found: %d", len(all_urls))
 
     if not all_urls:
         await ack.edit_text(
-            "😕 هیچ تصویری پیدا نشد. لطفاً کلمات دیگری امتحان کنید." if lang_fa
+            "😕 هیچ تصویری پیدا نشد. با کلمات دیگری امتحان کنید." if fa
             else "😕 No images found. Try different keywords!"
         )
-        conn.close()
         return
 
-    chosen = pick_fresh_images(conn, chat_id, query, all_urls, count=4)
+    # ── Step 4: Pick fresh images for this user ───────────────────────────────
+    chosen = pick_fresh(user_id, base_key, all_urls, count=4)
 
     if not chosen:
         await ack.edit_text(
-            "🔄 تمام تصاویر این موضوع قبلاً ارسال شده‌اند. لطفاً دوباره امتحان کنید تا تصاویر جدید بیایند." if lang_fa
-            else "🔄 You've seen all available images for this topic! Try again later or use a different query."
+            "🔄 تمام تصاویر این موضوع قبلاً ارسال شده‌اند!" if fa
+            else "🔄 You've seen all images for this topic! Try a slightly different search."
         )
-        conn.close()
         return
 
-    # Mark as sent BEFORE sending (prevents race conditions)
+    # ── Step 5: Update profile ────────────────────────────────────────────────
     for url in chosen:
-        mark_sent(conn, chat_id, query, url)
-    conn.close()
+        mark_sent(user_id, base_key, url)
+    update_profile(user_id, raw_query, new_tags)
 
-    # Delete ack and send media group
+    # ── Step 6: Send photos ───────────────────────────────────────────────────
     await ack.delete()
 
-    from telegram import InputMediaPhoto
+    caption = f"📌 {display_theme}" + (" • پینیفای" if fa else " • Pinify")
     media = [InputMediaPhoto(media=url) for url in chosen]
-    caption = f"📌 {raw_query}" + (" • پینیفای" if lang_fa else " • Pinify")
     media[0] = InputMediaPhoto(media=chosen[0], caption=caption)
 
     try:
         await message.reply_media_group(media=media)
     except Exception as exc:
-        log.error("Media group send failed: %s", exc)
-        # Fallback: send individually
+        log.error("Media group failed: %s", exc)
         for i, url in enumerate(chosen):
             try:
-                cap = caption if i == 0 else None
-                await message.reply_photo(photo=url, caption=cap)
+                await message.reply_photo(photo=url, caption=caption if i == 0 else None)
             except Exception as e2:
-                log.error("Single photo send failed: %s", e2)
+                log.error("Single photo failed: %s", e2)
 
 
-async def post_init(application: Application) -> None:
-    """Set bot commands visible in Telegram menu."""
-    await application.bot.set_my_commands([
-        BotCommand("start",  "Welcome & add to group"),
-        BotCommand("help",   "How to use Pinify"),
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start",   "Welcome & add to group"),
+        BotCommand("profile", "View your taste profile"),
     ])
-    log.info("Bot commands set.")
+    log.info("Pinify v2 ready.")
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError(
-            "Set the BOT_TOKEN environment variable before running!\n"
-            "  export BOT_TOKEN=123456:ABC-..."
-        )
+        raise RuntimeError("Set the BOT_TOKEN environment variable!")
+    if not ANTHROPIC_KEY:
+        log.warning("No ANTHROPIC_API_KEY — AI expansion disabled, using simple fallback.")
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    # Command handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-
-    # Message handler — catches any text containing pinme/پینمی (groups + private)
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_pinme,
-        )
-    )
-
-    log.info("🌸 Pinify is running — press Ctrl+C to stop")
+    log.info("🌸 Pinify v2 running")
     app.run_polling(drop_pending_updates=True)
 
 
