@@ -1,0 +1,21 @@
+# Database (Railway uses ephemeral storage — DB resets on redeploy)
+pinify.db
+
+# Secrets
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+venv/
+env/
+.venv/
