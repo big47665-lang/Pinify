@@ -1,5 +1,5 @@
 """
-Pinify Bot v4
+Pinify Bot v6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Changes from v3:
   • FIXED: Stars invoice now sends a real payment button (pay=True)
@@ -191,12 +191,18 @@ Recent searches: {hs}
 Taste profile tags: {ts}
 Tier: {"ProPin (premium)" if pro else "Free"}
 
-Generate {n} diverse Pinterest-style image search sub-queries in ENGLISH.
-{"ProPin: use niche aesthetic terminology, sub-cultures, specific visual styles, colour palettes, lighting moods, era references." if pro else "Make them specific and visual with aesthetic terminology."}
-Each sub-query should approach the topic from a different angle.
-Personalise to their taste profile where possible.
-Extract 4-8 short taste tags from this search.
-Write a 2-5 word display theme label.
+Generate {n} Pinterest search sub-queries following these CRITICAL ACCURACY RULES:
+1. NEVER change the core subject. Every sub-query must still be exactly about what the user asked.
+2. Only vary: aesthetic adjectives, synonyms, visual descriptors, medium, or mood words that still apply.
+3. Keep the original keywords in most sub-queries. Exact phrasing works best on Pinterest.
+4. If the query is a niche aesthetic (frutiger aero, dark academia, cottagecore, etc.) keep it verbatim in every sub-query.
+5. {"ProPin: add 1-2 niche sub-queries using highly specific terminology real pinners use as board names or pin titles." if pro else "Stay close to the original — do not drift into related but different topics."}
+
+GOOD example for 'frutiger aero night': ["frutiger aero night", "frutiger aero night aesthetic", "frutiger aero dark night", "frutiger aero night wallpaper"]
+BAD example — NEVER do this: ["Y2K night aesthetic", "retro digital dark art", "2000s computer vibes"]
+
+Personalise the sub-queries to their taste profile only if it doesn't change the subject.
+Extract 3-6 short taste tags from this search. Write a 2-5 word display theme label.
 
 Respond ONLY with valid JSON (no markdown):
 {{"sub_queries":["..."],"tags":["..."],"display_theme":"..."}}"""
@@ -221,76 +227,183 @@ def _simple_expand(q: str, pro: bool) -> dict:
     return {"sub_queries": s, "tags": [b], "display_theme": b}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scraper
+# Scraper — 4-layer Pinterest-accurate approach
 # ─────────────────────────────────────────────────────────────────────────────
-HDR = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-       "Accept": "text/html,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.5", "DNT": "1"}
-PIN_RE = re.compile(r'https://i\.pinimg\.com/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)', re.I)
+# Layer 1: Pinterest's own internal BaseSearchResource API (exact browser match)
+# Layer 2: Pinterest search page HTML — parse the embedded JSON state blob
+# Layer 3: Google Images filtered to i.pinimg.com CDN
+# Layer 4: DuckDuckGo fallback
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _up(u): return re.sub(r'/\d+x(?:/|\.)', '/736x/', u)
+PIN_RE   = re.compile(r'https://i\.pinimg\.com/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)', re.I)
+PIN_ORIG = re.compile(r'https://i\.pinimg\.com/originals/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)', re.I)
 
-def _vqd(q):
-    req = urllib.request.Request(
-        "https://duckduckgo.com/?q=" + urllib.parse.quote(q) + "&iax=images&ia=images", headers=HDR)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        html = r.read().decode("utf-8", errors="ignore")
-    m = re.search(r'vqd=(["\'])([^"\']+)\1', html) or re.search(r'vqd=([\d\-]+)', html)
-    return (m.group(2) if m and m.lastindex == 2 else m.group(1)) if m else ""
+HDR_BROWSER = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "DNT": "1",
+    "Connection": "keep-alive",
+}
+HDR_XHR = {
+    **HDR_BROWSER,
+    "Accept": "application/json, text/javascript, */*, q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.pinterest.com/",
+}
 
-def _ddg_json(q):
+def _up(u):
+    return re.sub(r'/\d+x(?:/|\.)', '/736x/', u)
+
+def _decompress(raw):
+    import gzip
+    try: return gzip.decompress(raw)
+    except: return raw
+
+def _extract_pinimg(text):
+    originals = PIN_ORIG.findall(text)
+    all_urls  = PIN_RE.findall(text)
+    seen, out = set(), []
+    for u in originals + all_urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def _layer1_pinterest_api(query):
+    """Pinterest's own internal search API — same endpoint the website calls."""
     try:
-        vqd = _vqd(f"{q} site:pinterest.com")
-        if not vqd: return []
-        p = urllib.parse.urlencode({"l":"us-en","o":"json",
-            "q":f"{q} site:pinterest.com","vqd":vqd,"f":",,,,,","p":"1"})
-        req = urllib.request.Request("https://duckduckgo.com/i.js?"+p,
-            headers={**HDR,"Referer":"https://duckduckgo.com/"})
-        time.sleep(0.25)
+        options = json.dumps({
+            "options": {
+                "query": query,
+                "scope": "pins",
+                "no_fetch_context_on_resource": False,
+                "page_size": 50,
+                "isPrefetch": False,
+            },
+            "context": {}
+        })
+        params = urllib.parse.urlencode({
+            "source_url": "/search/pins/?q=" + urllib.parse.quote(query) + "&rs=typed",
+            "data": options,
+        })
+        url = "https://www.pinterest.com/resource/BaseSearchResource/get/?" + params
+        req = urllib.request.Request(url, headers=HDR_XHR)
         with urllib.request.urlopen(req, timeout=12) as r:
+            data = json.loads(_decompress(r.read()).decode("utf-8", errors="ignore"))
+        results = (data.get("resource_response", {})
+                       .get("data", {})
+                       .get("results", []))
+        urls = []
+        for pin in results:
+            images = pin.get("images", {})
+            for size in ("orig", "736x", "564x", "474x"):
+                img = images.get(size, {})
+                u   = img.get("url", "")
+                if u and "pinimg.com" in u:
+                    urls.append(u); break
+        log.info("L1 Pinterest API: %d urls for '%s'", len(urls), query)
+        return urls
+    except Exception as e:
+        log.debug("L1 failed '%s': %s", query, e); return []
+
+def _layer2_pinterest_html(query):
+    """Fetch Pinterest search page and parse embedded JSON state blobs."""
+    try:
+        url = "https://www.pinterest.com/search/pins/?q=" + urllib.parse.quote(query) + "&rs=typed"
+        req = urllib.request.Request(url, headers=HDR_BROWSER)
+        with urllib.request.urlopen(req, timeout=14) as r:
+            html = _decompress(r.read()).decode("utf-8", errors="ignore")
+        urls = []
+        for pat in (
+            r'__PWS_INITIAL_PROPS__\s*=\s*(\{.+?\})\s*</script>',
+            r'__PWS_DATA__\s*=\s*(\{.+?\})\s*</script>',
+            r'"resource_response"\s*:\s*(\{.+?"results".+?\})\s*[,}]',
+        ):
+            for m in re.finditer(pat, html, re.DOTALL):
+                try: urls += _extract_pinimg(m.group(1))
+                except: pass
+        if not urls:
+            urls = _extract_pinimg(html)
+        log.info("L2 Pinterest HTML: %d urls for '%s'", len(urls), query)
+        return list(dict.fromkeys(urls))
+    except Exception as e:
+        log.debug("L2 failed '%s': %s", query, e); return []
+
+def _layer3_google(query):
+    """Google Images search filtered to Pinterest CDN — more accurate than DDG."""
+    try:
+        params = urllib.parse.urlencode({
+            "q":   query + " site:pinterest.com",
+            "tbm": "isch", "hl": "en", "gl": "us",
+        })
+        req = urllib.request.Request(
+            "https://www.google.com/search?" + params,
+            headers={**HDR_BROWSER, "Referer": "https://www.google.com/"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            html = _decompress(r.read()).decode("utf-8", errors="ignore")
+        urls = []
+        for m in re.finditer(r'AF_initDataCallback\(\{.*?data:(\[\[.*?\]\]).*?\}\)', html, re.DOTALL):
+            try: urls += _extract_pinimg(m.group(1))
+            except: pass
+        if not urls:
+            urls = _extract_pinimg(html)
+        log.info("L3 Google images: %d urls for '%s'", len(urls), query)
+        return list(dict.fromkeys(urls))
+    except Exception as e:
+        log.debug("L3 failed '%s': %s", query, e); return []
+
+def _layer4_ddg(query):
+    """DuckDuckGo image search — last resort fallback."""
+    try:
+        req = urllib.request.Request(
+            "https://duckduckgo.com/?q=" + urllib.parse.quote(query + " site:pinterest.com") + "&iax=images&ia=images",
+            headers=HDR_BROWSER)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        m = re.search(r'vqd=(["\'\'])([^\"\']+)\1', html) or re.search(r'vqd=([\d\-]+)', html)
+        if not m: return _extract_pinimg(html)
+        vqd = m.group(2) if m.lastindex == 2 else m.group(1)
+        p = urllib.parse.urlencode({"l":"us-en","o":"json",
+            "q": query + " site:pinterest.com","vqd":vqd,"f":",,,,,","p":"1"})
+        req2 = urllib.request.Request("https://duckduckgo.com/i.js?" + p,
+            headers={**HDR_BROWSER, "Referer": "https://duckduckgo.com/"})
+        time.sleep(0.2)
+        with urllib.request.urlopen(req2, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8","ignore"))
         urls = []
-        for item in data.get("results",[]):
+        for item in data.get("results", []):
             for k in ("image","thumbnail"):
                 v = item.get(k,"")
                 if v and "pinimg.com" in v: urls.append(_up(v)); break
+        log.info("L4 DDG: %d urls for '%s'", len(urls), query)
         return urls
-    except Exception as e: log.debug("ddg_json '%s': %s", q, e); return []
+    except Exception as e:
+        log.debug("L4 failed '%s': %s", query, e); return []
 
-def _ddg_html(q):
-    try:
-        url = "https://html.duckduckgo.com/html/?q="+urllib.parse.quote(f"{q} site:pinterest.com")
-        with urllib.request.urlopen(urllib.request.Request(url,headers=HDR),timeout=12) as r:
-            return [_up(u) for u in PIN_RE.findall(r.read().decode("utf-8","ignore"))]
-    except Exception as e: log.debug("ddg_html '%s': %s", q, e); return []
-
-def _bing(q):
-    try:
-        p = urllib.parse.urlencode({"q":f"{q} site:pinterest.com","form":"HDRSC2","first":"1"})
-        req = urllib.request.Request("https://www.bing.com/images/search?"+p,
-            headers={**HDR,"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-        with urllib.request.urlopen(req,timeout=12) as r:
-            return [_up(u) for u in PIN_RE.findall(r.read().decode("utf-8","ignore"))]
-    except Exception as e: log.debug("bing '%s': %s", q, e); return []
-
-def scrape_one(q):
-    urls = _ddg_json(q)
-    if len(urls) < 6: urls += _ddg_html(q)
-    if len(urls) < 6: urls += _bing(q)
-    return list(dict.fromkeys(urls))
+def scrape_one(query):
+    urls = _layer1_pinterest_api(query)
+    if len(urls) < 8: urls += _layer2_pinterest_html(query)
+    if len(urls) < 8: urls += _layer3_google(query)
+    if len(urls) < 8: urls += _layer4_ddg(query)
+    return list(dict.fromkeys(_up(u) for u in urls))
 
 def scrape_all(sub_queries):
     results = [[] for _ in sub_queries]
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(scrape_one, q): i for i,q in enumerate(sub_queries)}
+        futs = {pool.submit(scrape_one, q): i for i, q in enumerate(sub_queries)}
         for f in concurrent.futures.as_completed(futs):
             try: results[futs[f]] = f.result()
-            except: pass
+            except Exception as e: log.warning("scrape_all error: %s", e)
     out = []
     for i in range(max((len(r) for r in results), default=0)):
         for r in results:
             if i < len(r): out.append(r[i])
     return list(dict.fromkeys(out))
-
 def pick_fresh(uid, key, urls, count):
     random.shuffle(urls)
     chosen = []
@@ -758,16 +871,43 @@ async def handle_pinme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if fa:
         caption = f"📌 {theme}  •  {'پرو‌پین ' + BADGE_PRO if pro else 'پینیفای'}"
 
-    media    = [InputMediaPhoto(media=url) for url in chosen]
-    media[0] = InputMediaPhoto(media=chosen[0], caption=caption)
+    # Pre-validate URLs with HEAD requests to prevent the group double-send bug.
+    # In groups, reply_media_group can partially fail and trigger the except block,
+    # which re-sends photos that already went through — causing duplicates.
+    # By validating first and using a sent_ok flag we guarantee one send only.
+    valid_chosen = []
+    for url in chosen:
+        try:
+            req_head = urllib.request.Request(url, method="HEAD",
+                headers={"User-Agent": "TelegramBot/1.0"})
+            with urllib.request.urlopen(req_head, timeout=5):
+                valid_chosen.append(url)
+        except Exception:
+            log.debug("URL HEAD check failed, skipping: %s", url[:80])
 
+    if not valid_chosen:
+        await message.reply_text(
+            "😕 تصاویر پیدا شدند اما قابل بارگذاری نیستند. دوباره امتحان کنید." if fa
+            else "😕 Images found but couldn't load. Please try again.")
+        return
+
+    media    = [InputMediaPhoto(media=url) for url in valid_chosen]
+    media[0] = InputMediaPhoto(media=valid_chosen[0], caption=caption)
+
+    sent_ok = False
     try:
         await message.reply_media_group(media=media)
+        sent_ok = True
     except Exception as exc:
         log.error("Media group failed: %s", exc)
-        for i, url in enumerate(chosen):
-            try: await message.reply_photo(photo=url, caption=caption if i == 0 else None)
-            except Exception as e2: log.error("Single photo failed: %s", e2)
+
+    # Only fall back if the entire group send never happened
+    if not sent_ok:
+        for i, url in enumerate(valid_chosen):
+            try:
+                await message.reply_photo(photo=url, caption=caption if i == 0 else None)
+            except Exception as e2:
+                log.error("Single photo also failed: %s", e2)
 
     if warn_msg:
         await message.reply_text(
@@ -790,7 +930,7 @@ async def post_init(app: Application):
         BotCommand("admin",      "Admin panel (owner only)"),
     ]
     await app.bot.set_my_commands(cmds)
-    log.info("Pinify v5 ready 🌸")
+    log.info("Pinify v6 ready 🌸")
     log.info("OWNER_ID loaded: '%s' (len=%d)", OWNER_ID, len(OWNER_ID))
 
 def main():
@@ -816,7 +956,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    log.info("🌸 Pinify v5 running")
+    log.info("🌸 Pinify v6 running")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
