@@ -221,8 +221,10 @@ Respond ONLY with valid JSON (no markdown):
         return _simple_expand(raw_query, pro)
 
 def _simple_expand(q: str, pro: bool) -> dict:
+    """Fallback when Claude AI is unavailable. Always use exact query first."""
     b = q.strip()
-    s = [f"{b} aesthetic", f"{b} pinterest", f"{b} inspo", f"{b} mood board"]
+    # Exact query first — this is the most accurate for Pinterest
+    s = [b, f"{b} aesthetic", f"{b} wallpaper", f"{b} inspo"]
     if pro: s += [f"{b} photography", f"{b} editorial"]
     return {"sub_queries": s, "tags": [b], "display_theme": b}
 
@@ -257,10 +259,7 @@ def _serper_search(query: str, num: int = 20) -> list:
         req = urllib.request.Request(
             "https://google.serper.dev/images",
             data=payload,
-            headers={
-                "X-API-KEY": SERPER_KEY,
-                "Content-Type": "application/json",
-            }
+            headers={"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read().decode("utf-8"))
@@ -276,25 +275,33 @@ def _serper_search(query: str, num: int = 20) -> list:
                     urls.append(u)
         log.info("Serper '%s' -> %d images", query, len(urls))
         return list(dict.fromkeys(urls))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode()
+        except: pass
+        log.error("Serper HTTP %s for '%s': %s", e.code, query, body[:200])
+        return []
     except Exception as e:
         log.error("Serper failed '%s': %s", query, e)
         return []
 
-def scrape_one(query: str) -> list:
-    return _serper_search(query, num=20)
-
 def scrape_all(sub_queries: list) -> list:
-    results: list = [[] for _ in sub_queries]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(scrape_one, q): i for i, q in enumerate(sub_queries)}
-        for f in concurrent.futures.as_completed(futs):
-            try: results[futs[f]] = f.result()
-            except Exception as e: log.warning("scrape_all error: %s", e)
-    out = []
-    for i in range(max((len(r) for r in results), default=0)):
-        for r in results:
-            if i < len(r): out.append(r[i])
-    return list(dict.fromkeys(out))
+    """
+    Run only the FIRST sub-query (the exact original) against Serper.
+    Google Image Search with site:pinterest.com on the exact query
+    already returns perfect Pinterest results — no need to waste
+    API credits on multiple sub-queries.
+    If the first query returns fewer than 8 results, try the next one.
+    """
+    all_urls: list = []
+    for q in sub_queries:
+        urls = _serper_search(q, num=20)
+        for u in urls:
+            if u not in all_urls:
+                all_urls.append(u)
+        if len(all_urls) >= 15:
+            break
+    return all_urls
 
 def pick_fresh(uid, key, urls, count):
     random.shuffle(urls)
@@ -823,7 +830,7 @@ async def post_init(app: Application):
         BotCommand("admin",      "Admin panel (owner only)"),
     ]
     await app.bot.set_my_commands(cmds)
-    log.info("Pinify v8 ready 🌸")
+    log.info("Pinify v9 ready 🌸")
     log.info("OWNER_ID loaded: '%s' (len=%d)", OWNER_ID, len(OWNER_ID))
 
 def main():
@@ -851,7 +858,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    log.info("🌸 Pinify v8 running")
+    log.info("🌸 Pinify v9 running")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
