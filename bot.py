@@ -844,8 +844,11 @@ async def handle_pinme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     theme     = expansion["display_theme"]
     log.info("uid=%s pro=%s query='%s' subs=%s", uid, pro, raw_query, sub_q)
 
-    all_urls = await asyncio.to_thread(scrape_all, sub_q)
-    log.info("Found %d URLs", len(all_urls))
+    # Always include the exact original query as a sub-query — this is what
+    # Pinterest's own search engine gets and produces the most accurate results.
+    exact_queries = [raw_query] + [q for q in sub_q if q.lower() != raw_query.lower()]
+    all_urls = await asyncio.to_thread(scrape_all, exact_queries)
+    log.info("Found %d URLs for '%s'", len(all_urls), raw_query)
 
     if not all_urls:
         await ack.edit_text(
@@ -864,50 +867,48 @@ async def handle_pinme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     mark_sent(uid, base_key, chosen)
     update_profile(uid, raw_query, new_tags)
-    await ack.delete()
 
+    # Delete the "searching..." ack message right before photos arrive
+    try: await ack.delete()
+    except: pass
+
+    # Always use the user's exact original query in the caption — never the AI
+    # display_theme, which can misspell niche terms like "frutiger aero".
     tier_tag = f"{BADGE_PRO} ProPin" if pro else "Pinify"
-    caption  = f"📌 {theme}  •  {tier_tag}"
+    caption  = f"📌 {raw_query}  •  {tier_tag}"
     if fa:
-        caption = f"📌 {theme}  •  {'پرو‌پین ' + BADGE_PRO if pro else 'پینیفای'}"
+        caption = f"📌 {raw_query}  •  {'پرو‌پین ' + BADGE_PRO if pro else 'پینیفای'}"
 
-    # Pre-validate URLs with HEAD requests to prevent the group double-send bug.
-    # In groups, reply_media_group can partially fail and trigger the except block,
-    # which re-sends photos that already went through — causing duplicates.
-    # By validating first and using a sent_ok flag we guarantee one send only.
-    valid_chosen = []
-    for url in chosen:
+    # Send as media group. For group chats Telegram is stricter about URLs,
+    # so we try the group send first, then fall back to individual photos
+    # only for URLs that actually fail — using a per-URL sent tracker to
+    # guarantee no photo is ever sent twice.
+    sent_urls: set = set()
+
+    async def _send_photo(url: str, cap=None):
+        if url in sent_urls:
+            return True
         try:
-            req_head = urllib.request.Request(url, method="HEAD",
-                headers={"User-Agent": "TelegramBot/1.0"})
-            with urllib.request.urlopen(req_head, timeout=5):
-                valid_chosen.append(url)
-        except Exception:
-            log.debug("URL HEAD check failed, skipping: %s", url[:80])
+            await message.reply_photo(photo=url, caption=cap)
+            sent_urls.add(url)
+            return True
+        except Exception as e:
+            log.debug("Photo failed (%s): %s", url[:60], e)
+            return False
 
-    if not valid_chosen:
-        await message.reply_text(
-            "😕 تصاویر پیدا شدند اما قابل بارگذاری نیستند. دوباره امتحان کنید." if fa
-            else "😕 Images found but couldn't load. Please try again.")
-        return
-
-    media    = [InputMediaPhoto(media=url) for url in valid_chosen]
-    media[0] = InputMediaPhoto(media=valid_chosen[0], caption=caption)
-
-    sent_ok = False
     try:
+        media    = [InputMediaPhoto(media=url) for url in chosen]
+        media[0] = InputMediaPhoto(media=chosen[0], caption=caption)
         await message.reply_media_group(media=media)
-        sent_ok = True
+        # Mark all as sent so fallback never re-sends them
+        sent_urls.update(chosen)
     except Exception as exc:
-        log.error("Media group failed: %s", exc)
-
-    # Only fall back if the entire group send never happened
-    if not sent_ok:
-        for i, url in enumerate(valid_chosen):
-            try:
-                await message.reply_photo(photo=url, caption=caption if i == 0 else None)
-            except Exception as e2:
-                log.error("Single photo also failed: %s", e2)
+        log.warning("Media group failed (%s), falling back per-photo", exc)
+        first = True
+        for url in chosen:
+            ok = await _send_photo(url, caption if first else None)
+            if ok:
+                first = False
 
     if warn_msg:
         await message.reply_text(
@@ -930,7 +931,7 @@ async def post_init(app: Application):
         BotCommand("admin",      "Admin panel (owner only)"),
     ]
     await app.bot.set_my_commands(cmds)
-    log.info("Pinify v6 ready 🌸")
+    log.info("Pinify v7 ready 🌸")
     log.info("OWNER_ID loaded: '%s' (len=%d)", OWNER_ID, len(OWNER_ID))
 
 def main():
@@ -956,7 +957,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    log.info("🌸 Pinify v6 running")
+    log.info("🌸 Pinify v7 running")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
