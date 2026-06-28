@@ -30,7 +30,7 @@ from telegram.constants import ParseMode
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OWNER_ID      = os.getenv("OWNER_ID", "")        # your Telegram numeric user ID
+OWNER_ID      = os.getenv("OWNER_ID", "").strip()  # your Telegram numeric user ID
 DB_PATH       = "pinify.db"
 
 FREE_DAILY_LIMIT  = 15
@@ -73,12 +73,13 @@ def _db() -> sqlite3.Connection:
 DB = _db()
 
 def _get_row(user_id: str) -> dict:
-    row = DB.execute("SELECT * FROM user_profile WHERE user_id=?", (user_id,)).fetchone()
+    cur = DB.execute("SELECT * FROM user_profile WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
     if not row:
         DB.execute("INSERT INTO user_profile (user_id) VALUES (?)", (user_id,))
         DB.commit()
-        return _get_row(user_id)
-    cur = DB.execute("SELECT * FROM user_profile WHERE user_id=?", (user_id,))
+        cur = DB.execute("SELECT * FROM user_profile WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
     cols = [d[0] for d in cur.description]
     return dict(zip(cols, row))
 
@@ -341,6 +342,27 @@ async def send_invoice(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# /whoami  — debug: shows your user ID and owner status
+# ─────────────────────────────────────────────────────────────────────────────
+async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid  = str(update.effective_user.id)
+    name = update.effective_user.first_name or "?"
+    owner_id_loaded = repr(OWNER_ID)
+    match = is_owner(uid)
+    lines = [
+        "🔍 *Debug Info*",
+        "",
+        f"Your user ID: `{uid}`",
+        f"Your name: {name}",
+        "OWNER_ID in bot: `" + owner_id_loaded + "`",
+        f"Owner match: `{match}`",
+        f"Is pro: `{is_pro(uid)}`",
+    ]
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # /start
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -349,6 +371,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _get_row(uid)
     pro   = is_pro(uid)
     owner = is_owner(uid)
+
+    # Deep link: /start buypro  → immediately show invoice
+    if ctx.args and ctx.args[0] == "buypro" and not pro and not owner:
+        await update.message.reply_text(
+            "⭐ *Get " + BADGE_PRO + " ProPin!*\n\nTap below to pay with Telegram Stars:",
+            parse_mode=ParseMode.MARKDOWN)
+        await send_invoice(update.message.chat_id, ctx)
+        return
     badge = f"{BADGE_PRO} " if pro else ""
     tier  = ("Owner " + BADGE_PRO) if owner else ("ProPin " + BADGE_PRO if pro else "Free")
 
@@ -594,6 +624,18 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if is_owner(uid):
             await q.answer("👑 You're the owner — ProPin is permanent!", show_alert=True)
             return
+        chat_type = q.message.chat.type
+        if chat_type != "private":
+            # Stars invoices only work in private DM chats
+            me2 = (await ctx.bot.get_me()).username
+            await q.answer("Payment only works in private chat!", show_alert=True)
+            await q.message.reply_text(
+                f"⭐ To buy ProPin, open a private chat with me:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Pay in private chat",
+                                         url=f"https://t.me/{me2}?start=buypro")
+                ]]))
+            return
         await q.message.reply_text("⬇️ Tap the button below to pay with Stars:")
         await send_invoice(q.message.chat_id, ctx)
 
@@ -748,7 +790,8 @@ async def post_init(app: Application):
         BotCommand("admin",      "Admin panel (owner only)"),
     ]
     await app.bot.set_my_commands(cmds)
-    log.info("Pinify v4 ready 🌸")
+    log.info("Pinify v5 ready 🌸")
+    log.info("OWNER_ID loaded: '%s' (len=%d)", OWNER_ID, len(OWNER_ID))
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
@@ -761,6 +804,7 @@ def main():
         log.info("Owner ID: %s", OWNER_ID)
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("whoami",    cmd_whoami))
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("profile",   cmd_profile))
     app.add_handler(CommandHandler("upgrade",   cmd_upgrade))
@@ -772,7 +816,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    log.info("🌸 Pinify v4 running")
+    log.info("🌸 Pinify v5 running")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
