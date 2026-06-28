@@ -227,173 +227,64 @@ def _simple_expand(q: str, pro: bool) -> dict:
     return {"sub_queries": s, "tags": [b], "display_theme": b}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scraper — 4-layer Pinterest-accurate approach
+# Scraper — Serper.dev Google Images API (Pinterest-accurate)
 # ─────────────────────────────────────────────────────────────────────────────
-# Layer 1: Pinterest's own internal BaseSearchResource API (exact browser match)
-# Layer 2: Pinterest search page HTML — parse the embedded JSON state blob
-# Layer 3: Google Images filtered to i.pinimg.com CDN
-# Layer 4: DuckDuckGo fallback
+# Serper.dev wraps Google Image Search. With site:pinterest.com it returns
+# exactly what Pinterest shows — works from any server IP, no blocking.
+# Free tier: 2,500 searches. After that ~$0.30/1000 searches.
+# Get your free key at: https://serper.dev
 # ─────────────────────────────────────────────────────────────────────────────
 
-PIN_RE   = re.compile(r'https://i\.pinimg\.com/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)', re.I)
-PIN_ORIG = re.compile(r'https://i\.pinimg\.com/originals/[^\s"\'\\><]+\.(?:jpg|jpeg|png|webp)', re.I)
-
-HDR_BROWSER = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "DNT": "1",
-    "Connection": "keep-alive",
-}
-HDR_XHR = {
-    **HDR_BROWSER,
-    "Accept": "application/json, text/javascript, */*, q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.pinterest.com/",
-}
+SERPER_KEY = os.getenv("SERPER_API_KEY", "")
+PIN_RE = re.compile(r'https://i[.]pinimg[.]com/[^\x00-\x1f"<>\\]+[.](jpg|jpeg|png|webp)', re.IGNORECASE)
 
 def _up(u):
+    """Upgrade any size prefix to 736x (high res)."""
     return re.sub(r'/\d+x(?:/|\.)', '/736x/', u)
 
-def _decompress(raw):
-    import gzip
-    try: return gzip.decompress(raw)
-    except: return raw
-
-def _extract_pinimg(text):
-    originals = PIN_ORIG.findall(text)
-    all_urls  = PIN_RE.findall(text)
-    seen, out = set(), []
-    for u in originals + all_urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-def _layer1_pinterest_api(query):
-    """Pinterest's own internal search API — same endpoint the website calls."""
+def _serper_search(query: str, num: int = 20) -> list:
+    """Google Images via Serper.dev, filtered to pinterest.com."""
+    if not SERPER_KEY:
+        log.warning("No SERPER_API_KEY — scraper disabled")
+        return []
     try:
-        options = json.dumps({
-            "options": {
-                "query": query,
-                "scope": "pins",
-                "no_fetch_context_on_resource": False,
-                "page_size": 50,
-                "isPrefetch": False,
-            },
-            "context": {}
-        })
-        params = urllib.parse.urlencode({
-            "source_url": "/search/pins/?q=" + urllib.parse.quote(query) + "&rs=typed",
-            "data": options,
-        })
-        url = "https://www.pinterest.com/resource/BaseSearchResource/get/?" + params
-        req = urllib.request.Request(url, headers=HDR_XHR)
+        payload = json.dumps({
+            "q": f"{query} site:pinterest.com",
+            "num": num,
+            "gl": "us",
+            "hl": "en",
+        }).encode()
+        req = urllib.request.Request(
+            "https://google.serper.dev/images",
+            data=payload,
+            headers={
+                "X-API-KEY": SERPER_KEY,
+                "Content-Type": "application/json",
+            }
+        )
         with urllib.request.urlopen(req, timeout=12) as r:
-            data = json.loads(_decompress(r.read()).decode("utf-8", errors="ignore"))
-        results = (data.get("resource_response", {})
-                       .get("data", {})
-                       .get("results", []))
+            data = json.loads(r.read().decode("utf-8"))
         urls = []
-        for pin in results:
-            images = pin.get("images", {})
-            for size in ("orig", "736x", "564x", "474x"):
-                img = images.get(size, {})
-                u   = img.get("url", "")
+        for item in data.get("images", []):
+            for key in ("imageUrl", "thumbnailUrl"):
+                u = item.get(key, "")
                 if u and "pinimg.com" in u:
-                    urls.append(u); break
-        log.info("L1 Pinterest API: %d urls for '%s'", len(urls), query)
-        return urls
-    except Exception as e:
-        log.debug("L1 failed '%s': %s", query, e); return []
-
-def _layer2_pinterest_html(query):
-    """Fetch Pinterest search page and parse embedded JSON state blobs."""
-    try:
-        url = "https://www.pinterest.com/search/pins/?q=" + urllib.parse.quote(query) + "&rs=typed"
-        req = urllib.request.Request(url, headers=HDR_BROWSER)
-        with urllib.request.urlopen(req, timeout=14) as r:
-            html = _decompress(r.read()).decode("utf-8", errors="ignore")
-        urls = []
-        for pat in (
-            r'__PWS_INITIAL_PROPS__\s*=\s*(\{.+?\})\s*</script>',
-            r'__PWS_DATA__\s*=\s*(\{.+?\})\s*</script>',
-            r'"resource_response"\s*:\s*(\{.+?"results".+?\})\s*[,}]',
-        ):
-            for m in re.finditer(pat, html, re.DOTALL):
-                try: urls += _extract_pinimg(m.group(1))
-                except: pass
-        if not urls:
-            urls = _extract_pinimg(html)
-        log.info("L2 Pinterest HTML: %d urls for '%s'", len(urls), query)
+                    urls.append(_up(u)); break
+            else:
+                u = item.get("imageUrl", "")
+                if u and u.startswith("http"):
+                    urls.append(u)
+        log.info("Serper '%s' -> %d images", query, len(urls))
         return list(dict.fromkeys(urls))
     except Exception as e:
-        log.debug("L2 failed '%s': %s", query, e); return []
+        log.error("Serper failed '%s': %s", query, e)
+        return []
 
-def _layer3_google(query):
-    """Google Images search filtered to Pinterest CDN — more accurate than DDG."""
-    try:
-        params = urllib.parse.urlencode({
-            "q":   query + " site:pinterest.com",
-            "tbm": "isch", "hl": "en", "gl": "us",
-        })
-        req = urllib.request.Request(
-            "https://www.google.com/search?" + params,
-            headers={**HDR_BROWSER, "Referer": "https://www.google.com/"})
-        with urllib.request.urlopen(req, timeout=12) as r:
-            html = _decompress(r.read()).decode("utf-8", errors="ignore")
-        urls = []
-        for m in re.finditer(r'AF_initDataCallback\(\{.*?data:(\[\[.*?\]\]).*?\}\)', html, re.DOTALL):
-            try: urls += _extract_pinimg(m.group(1))
-            except: pass
-        if not urls:
-            urls = _extract_pinimg(html)
-        log.info("L3 Google images: %d urls for '%s'", len(urls), query)
-        return list(dict.fromkeys(urls))
-    except Exception as e:
-        log.debug("L3 failed '%s': %s", query, e); return []
+def scrape_one(query: str) -> list:
+    return _serper_search(query, num=20)
 
-def _layer4_ddg(query):
-    """DuckDuckGo image search — last resort fallback."""
-    try:
-        req = urllib.request.Request(
-            "https://duckduckgo.com/?q=" + urllib.parse.quote(query + " site:pinterest.com") + "&iax=images&ia=images",
-            headers=HDR_BROWSER)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            html = r.read().decode("utf-8", errors="ignore")
-        m = re.search(r'vqd=(["\'\'])([^\"\']+)\1', html) or re.search(r'vqd=([\d\-]+)', html)
-        if not m: return _extract_pinimg(html)
-        vqd = m.group(2) if m.lastindex == 2 else m.group(1)
-        p = urllib.parse.urlencode({"l":"us-en","o":"json",
-            "q": query + " site:pinterest.com","vqd":vqd,"f":",,,,,","p":"1"})
-        req2 = urllib.request.Request("https://duckduckgo.com/i.js?" + p,
-            headers={**HDR_BROWSER, "Referer": "https://duckduckgo.com/"})
-        time.sleep(0.2)
-        with urllib.request.urlopen(req2, timeout=12) as r:
-            data = json.loads(r.read().decode("utf-8","ignore"))
-        urls = []
-        for item in data.get("results", []):
-            for k in ("image","thumbnail"):
-                v = item.get(k,"")
-                if v and "pinimg.com" in v: urls.append(_up(v)); break
-        log.info("L4 DDG: %d urls for '%s'", len(urls), query)
-        return urls
-    except Exception as e:
-        log.debug("L4 failed '%s': %s", query, e); return []
-
-def scrape_one(query):
-    urls = _layer1_pinterest_api(query)
-    if len(urls) < 8: urls += _layer2_pinterest_html(query)
-    if len(urls) < 8: urls += _layer3_google(query)
-    if len(urls) < 8: urls += _layer4_ddg(query)
-    return list(dict.fromkeys(_up(u) for u in urls))
-
-def scrape_all(sub_queries):
-    results = [[] for _ in sub_queries]
+def scrape_all(sub_queries: list) -> list:
+    results: list = [[] for _ in sub_queries]
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futs = {pool.submit(scrape_one, q): i for i, q in enumerate(sub_queries)}
         for f in concurrent.futures.as_completed(futs):
@@ -404,6 +295,7 @@ def scrape_all(sub_queries):
         for r in results:
             if i < len(r): out.append(r[i])
     return list(dict.fromkeys(out))
+
 def pick_fresh(uid, key, urls, count):
     random.shuffle(urls)
     chosen = []
@@ -931,7 +823,7 @@ async def post_init(app: Application):
         BotCommand("admin",      "Admin panel (owner only)"),
     ]
     await app.bot.set_my_commands(cmds)
-    log.info("Pinify v7 ready 🌸")
+    log.info("Pinify v8 ready 🌸")
     log.info("OWNER_ID loaded: '%s' (len=%d)", OWNER_ID, len(OWNER_ID))
 
 def main():
@@ -939,6 +831,8 @@ def main():
         raise RuntimeError("Set BOT_TOKEN env var!")
     if not ANTHROPIC_KEY:
         log.warning("No ANTHROPIC_API_KEY set.")
+    if not SERPER_KEY:
+        log.error("SERPER_API_KEY missing — get free key at serper.dev")
     if not OWNER_ID:
         log.warning("No OWNER_ID set — owner features disabled.")
     else:
@@ -957,7 +851,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pinme))
 
-    log.info("🌸 Pinify v7 running")
+    log.info("🌸 Pinify v8 running")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
